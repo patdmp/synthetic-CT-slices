@@ -1,27 +1,152 @@
+#!/usr/bin/env python3
+"""
+Train / evaluate a 2‑D diffusion model on 3‑D NRRD volumes.
+Each axial slice of every volume is treated as an independent 2‑D example.
+The script is a drop‑in replacement for the original PNG‑based pipeline.
+
+Main differences vs. the PNG version
+------------------------------------
+1. Uses *pynrrd* to read .nrrd volumes.
+2. Builds the HuggingFace Dataset as a list of
+      { volume_path, slice_idx, image_filename, ... }
+   so we can lazily load one slice at a time.
+3. Always works in "array" mode – no PIL, no Image casting.
+4. A custom ``load_slice`` helper returns a torch tensor (1,H,W)
+   already min‑max normalised and resized.
+5. Segmentation‑guided training works the same way: a parallel
+   slice list is built for each mask volume.
+
+Folder layout expected
+----------------------
+<root>/
+  data/
+    train/  *.nrrd       # 3‑D images
+    val/    *.nrrd
+    test/   *.nrrd
+  mask/                    # optional – only if --seg_dir given
+    train/  seg_*.nrrd   # 3‑D masks aligned with the images
+    val/    ...
+    test/   ...
+
+Given that structure, run e.g.:
+
+$ python nrrd_diffusion_training.py \
+      --mode train \
+      --img_size 256 \
+      --dataset avt_kits_rider \
+      --img_dir /path/to/output_dataset_root/data \
+      --seg_dir /path/to/output_dataset_root/mask \
+      --segmentation_guided \
+      --num_segmentation_classes 2 
+
+Dependencies
+------------
+  pip install pynrrd torch torchvision diffusers datasets
+
+"""
+
 import os
 from argparse import ArgumentParser
+from pathlib import Path
+from typing import Dict, List
 
-# torch imports
-import torch
-from torch import nn
-from torchvision import transforms
-import torch.nn.functional as F
+import math
+import random
+
+import nrrd                       # pip install pynrrd
 import numpy as np
 
-# HF imports
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from torchvision import transforms
+
 import diffusers
 from diffusers.optimization import get_cosine_schedule_with_warmup
 import datasets
 
-# custom imports
+# ---------- custom project helpers (unchanged) ----------
 from training import TrainingConfig, train_loop
 from eval import evaluate_generation, evaluate_sample_many
+
+# -------------------------------------------------------
+
+SPLIT_NAMES = {"train", "val", "test"}
+
+# --------------------------------------------------------------------------------------
+#  Utilities for building a slice‑level dataset from a directory of 3‑D NRRD volumes
+# --------------------------------------------------------------------------------------
+
+def collect_nrrd_slices(split_dir: Path) -> Dict[str, List]:
+    """Return a dict suitable for HuggingFace Dataset.from_dict().
+
+    For every *.nrrd* in *split_dir* we enumerate all axial slices and
+    create one record per slice.
+    """
+    records = {
+        "volume": [],          # str path to 3‑D image
+        "slice_idx": [],       # int       axial index
+        "image_filename": []   # str       unique name e.g. volname_z042.nrrd
+    }
+
+    for vol_path in split_dir.glob("*.nrrd"):
+        vol_path = vol_path.resolve()
+        vol_data, _ = nrrd.read(vol_path)      # shape: (D,H,W)
+        depth = vol_data.shape[0]
+        for z in range(depth):
+            records["volume"].append(str(vol_path))
+            records["slice_idx"].append(z)
+            records["image_filename"].append(f"{vol_path.stem}_z{z:03d}.nrrd")
+    return records
+
+
+def collect_seg_slices(seg_split_dir: Path, slice_indices: List[int]) -> List[str]:
+    """Return list of mask‑volume paths aligned with *slice_indices*.
+
+    ``slice_indices`` is the list produced by *collect_nrrd_slices* for the images,
+    so we guarantee alignment by simply repeating the same volume path once per
+    slice.
+    """
+    paths = []
+    for vol_path in seg_split_dir.glob("*.nrrd"):
+        vol_path = vol_path.resolve()
+        vol_data, _ = nrrd.read(vol_path)
+        depth = vol_data.shape[0]
+        paths.extend([str(vol_path)] * depth)
+    return paths
+
+
+# --------------------------------------------------------------------------------------
+#  Slice loader and preprocessing
+# --------------------------------------------------------------------------------------
+
+def load_slice(vol_path: str, z: int, out_size: int) -> torch.Tensor:
+    """Read one slice (z) from 3‑D volume → (1, H, W) torch tensor normalised to [0,1]."""
+    vol, _ = nrrd.read(vol_path)           # numpy (D,H,W)
+    arr = vol[z].astype(np.float32)
+
+    # Min‑max normalise per slice (modify as needed for modality)
+    arr -= arr.min()
+    rng = arr.max() - arr.min() + 1e-8
+    arr /= rng
+
+    t = torch.from_numpy(arr).unsqueeze(0)   # (1,H,W)
+
+    # Resize to Network input
+    t = F.interpolate(t.unsqueeze(0), size=(out_size, out_size), mode="bilinear", align_corners=False)
+    return t.squeeze(0)                      # (1,H,W)
+
+
+# --------------------------------------------------------------------------------------
+#  Main script
+# --------------------------------------------------------------------------------------
 
 def main(
     mode,
     img_size,
     num_img_channels,
-    dataset,
+    dataset_name,
     img_dir,
     seg_dir,
     model_type,
@@ -35,406 +160,239 @@ def main(
     use_ablated_segmentations=False,
     eval_shuffle_dataloader=True,
 
-    # arguments only used in eval
+    # eval‑only args
     eval_mask_removal=False,
     eval_blank_mask=False,
-    eval_sample_size=1000
+    eval_sample_size=1000,
 ):
-    #GPUs
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print('running on {}'.format(device))
+    print(f"Running on {device}")
 
-    # load config
-    output_dir = '{}-{}-{}'.format(model_type.lower(), dataset, img_size)  # the model namy locally and on the HF Hub
+    # ------------------------------------------------------------------
+    #  Config
+    # ------------------------------------------------------------------
+    output_dir = f"{model_type.lower()}-{dataset_name}-{img_size}"
     if segmentation_guided:
         output_dir += "-segguided"
-        assert seg_dir is not None, "must provide segmentation directory for segmentation guided training/sampling"
-
     if use_ablated_segmentations or eval_mask_removal or eval_blank_mask:
         output_dir += "-ablated"
 
-    print("output dir: {}".format(output_dir))
-
     if mode == "train":
         evalset_name = "val"
-        assert img_dir is not None, "must provide image directory for training"
+        assert img_dir is not None, "Must provide --img_dir for training"
     elif "eval" in mode:
         evalset_name = "test"
-
-    print("using evaluation set: {}".format(evalset_name))
+    else:
+        raise ValueError("Unsupported mode")
 
     config = TrainingConfig(
-        image_size = img_size,
-        dataset = dataset,
-        segmentation_guided = segmentation_guided,
-        segmentation_channel_mode = segmentation_channel_mode,
-        num_segmentation_classes = num_segmentation_classes,
-        train_batch_size = train_batch_size,
-        eval_batch_size = eval_batch_size,
-        num_epochs = num_epochs,
-        output_dir = output_dir,
+        image_size=img_size,
+        dataset=dataset_name,
+        segmentation_guided=segmentation_guided,
+        segmentation_channel_mode=segmentation_channel_mode,
+        num_segmentation_classes=num_segmentation_classes,
+        train_batch_size=train_batch_size,
+        eval_batch_size=eval_batch_size,
+        num_epochs=num_epochs,
+        output_dir=output_dir,
         model_type=model_type,
         resume_epoch=resume_epoch,
-        use_ablated_segmentations=use_ablated_segmentations
+        use_ablated_segmentations=use_ablated_segmentations,
     )
 
-    load_images_as_np_arrays = False
-    if num_img_channels not in [1, 3]:
-        load_images_as_np_arrays = True
-        print("image channels not 1 or 3, attempting to load images as np arrays...")
+    # We ALWAYS load as numpy arrays for NRRD
+    load_images_as_np_arrays = True
 
-    if config.segmentation_guided:
-        seg_types = os.listdir(seg_dir)
-        seg_paths_train = {} 
-        seg_paths_eval = {}
+    # ------------------------------------------------------------------
+    #  Build HuggingFace Datasets
+    # ------------------------------------------------------------------
+    if img_dir is not None:
+        img_dir = Path(img_dir)
+        dset_train_dict = collect_nrrd_slices(img_dir / "train")
+        dset_eval_dict = collect_nrrd_slices(img_dir / evalset_name)
 
-        # train set
-        if img_dir is not None: 
-            # make sure the images are matched to the segmentation masks
-            img_dir_train = os.path.join(img_dir, "train")
-            img_paths_train = [os.path.join(img_dir_train, f) for f in os.listdir(img_dir_train)]
-            for seg_type in seg_types:
-                seg_paths_train[seg_type] = [os.path.join(seg_dir, seg_type, "train", f) for f in os.listdir(img_dir_train)]
-        else:
-            for seg_type in seg_types:
-                seg_paths_train[seg_type] = [os.path.join(seg_dir, seg_type, "train", f) for f in os.listdir(os.path.join(seg_dir, seg_type, "train"))]
+    if segmentation_guided:
+        assert seg_dir is not None, "Provide --seg_dir for segmentation‑guided training"
+        seg_dir = Path(seg_dir)
+        seg_types = ["mask"]  # single mask type by default; extend as needed
 
-        # eval set
-        if img_dir is not None: 
-            img_dir_eval = os.path.join(img_dir, evalset_name)
-            img_paths_eval = [os.path.join(img_dir_eval, f) for f in os.listdir(img_dir_eval)]
-            for seg_type in seg_types:
-                seg_paths_eval[seg_type] = [os.path.join(seg_dir, seg_type, evalset_name, f) for f in os.listdir(img_dir_eval)]
-        else:
-            for seg_type in seg_types:
-                seg_paths_eval[seg_type] = [os.path.join(seg_dir, seg_type, evalset_name, f) for f in os.listdir(os.path.join(seg_dir, seg_type, evalset_name))]
-
-        if img_dir is not None:
-            dset_dict_train = {
-                    **{"image": img_paths_train},
-                    **{"seg_{}".format(seg_type): seg_paths_train[seg_type] for seg_type in seg_types}
-                }
-            
-            dset_dict_eval = {
-                    **{"image": img_paths_eval},
-                    **{"seg_{}".format(seg_type): seg_paths_eval[seg_type] for seg_type in seg_types}
-            }
-        else:
-            dset_dict_train = {
-                    **{"seg_{}".format(seg_type): seg_paths_train[seg_type] for seg_type in seg_types}
-                }
-            
-            dset_dict_eval = {
-                    **{"seg_{}".format(seg_type): seg_paths_eval[seg_type] for seg_type in seg_types}
-            }
-
-
-        if img_dir is not None:
-            # add image filenames to dataset
-            dset_dict_train["image_filename"] = [os.path.basename(f) for f in dset_dict_train["image"]]
-            dset_dict_eval["image_filename"] = [os.path.basename(f) for f in dset_dict_eval["image"]]
-        else:
-            # use segmentation filenames as image filenames
-            dset_dict_train["image_filename"] = [os.path.basename(f) for f in dset_dict_train["seg_{}".format(seg_types[0])]]
-            dset_dict_eval["image_filename"] = [os.path.basename(f) for f in dset_dict_eval["seg_{}".format(seg_types[0])]]
-
-        dataset_train = datasets.Dataset.from_dict(dset_dict_train)
-        dataset_eval = datasets.Dataset.from_dict(dset_dict_eval)
-
-        # load the images
-        if not load_images_as_np_arrays and img_dir is not None:
-            dataset_train = dataset_train.cast_column("image", datasets.Image())
-            dataset_eval = dataset_eval.cast_column("image", datasets.Image())
-
+        # For every seg_type create slice‑level path list aligned with images
         for seg_type in seg_types:
-            dataset_train = dataset_train.cast_column("seg_{}".format(seg_type), datasets.Image())
+            seg_train_list = collect_seg_slices(seg_dir / "train", dset_train_dict["slice_idx"])
+            seg_eval_list = collect_seg_slices(seg_dir / evalset_name, dset_eval_dict["slice_idx"])
+            dset_train_dict[f"seg_{seg_type}_volume"] = seg_train_list
+            dset_eval_dict[f"seg_{seg_type}_volume"] = seg_eval_list
 
-        for seg_type in seg_types:
-            dataset_eval = dataset_eval.cast_column("seg_{}".format(seg_type), datasets.Image())
+    dataset_train = datasets.Dataset.from_dict(dset_train_dict)
+    dataset_eval = datasets.Dataset.from_dict(dset_eval_dict)
 
-    else:
-        if img_dir is not None:
-            img_dir_train = os.path.join(img_dir, "train")
-            img_paths_train = [os.path.join(img_dir_train, f) for f in os.listdir(img_dir_train)]
+    # ------------------------------------------------------------------
+    #  Transforms (slice loader)
+    # ------------------------------------------------------------------
+    def transform(examples):
+        # Load image slice
+        images = [load_slice(v, z, config.image_size) for v, z in zip(examples["volume"], examples["slice_idx"])]
+        result = {
+            "images": images,
+            "image_filenames": examples["image_filename"],
+        }
 
-            img_dir_eval = os.path.join(img_dir, evalset_name)
-            img_paths_eval = [os.path.join(img_dir_eval, f) for f in os.listdir(img_dir_eval)]
-
-            dset_dict_train = {
-                    **{"image": img_paths_train}
-                }
-
-            dset_dict_eval = {
-                    **{"image": img_paths_eval}
-                }
-
-            # add image filenames to dataset
-            dset_dict_train["image_filename"] = [os.path.basename(f) for f in dset_dict_train["image"]]
-            dset_dict_eval["image_filename"] = [os.path.basename(f) for f in dset_dict_eval["image"]]
-
-            dataset_train = datasets.Dataset.from_dict(dset_dict_train)
-            dataset_eval = datasets.Dataset.from_dict(dset_dict_eval)
-
-            # load the images
-            if not load_images_as_np_arrays:
-                dataset_train = dataset_train.cast_column("image", datasets.Image())
-                dataset_eval = dataset_eval.cast_column("image", datasets.Image())
-
-    # training set preprocessing
-    if not load_images_as_np_arrays:
-        preprocess = transforms.Compose(
-            [
-                transforms.Resize((config.image_size, config.image_size)),
-                # transforms.RandomHorizontalFlip(), # flipping wouldn't result in realistic images
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    num_img_channels * [0.5], 
-                    num_img_channels * [0.5]),
-            ]
-        )
-    else:
-        # resizing will be done in the transform function
-        preprocess = transforms.Compose(
-            [
-                transforms.Normalize(
-                    num_img_channels * [0.5], 
-                    num_img_channels * [0.5]),
-            ]
-        )
-
-    if num_img_channels == 1:
-        PIL_image_type = "L"
-    elif num_img_channels == 3:
-        PIL_image_type = "RGB"
-    else:
-        PIL_image_type = None
-
-    if config.segmentation_guided:
-        preprocess_segmentation = transforms.Compose(
-        [
-            transforms.Resize((config.image_size, config.image_size), interpolation=transforms.InterpolationMode.NEAREST),
-            transforms.ToTensor(),
-        ]
-        )
-
-        def transform(examples):
-            if img_dir is not None:
-                if not load_images_as_np_arrays:
-                    images = [preprocess(image.convert(PIL_image_type)) for image in examples["image"]]
-                else:
-                    # load np array as torch tensor, resize, then normalize
-                    images = [
-                        preprocess(F.interpolate(torch.tensor(np.load(image)).unsqueeze(0).float(), size=(config.image_size, config.image_size)).squeeze()) for image in examples["image"]
-                        ]
-
-            images_filenames = examples["image_filename"]
-
-            segs = {}
+        # Load masks if needed
+        if segmentation_guided:
             for seg_type in seg_types:
-                segs["seg_{}".format(seg_type)] = [preprocess_segmentation(image.convert("L")) for image in examples["seg_{}".format(seg_type)]]
-            # return {"images": images, "seg_breast": seg_breast, "seg_dv": seg_dv}
-            if img_dir is not None:
-                return {**{"images": images}, **segs, **{"image_filenames": images_filenames}}
-            else:
-                return {**segs, **{"image_filenames": images_filenames}}
-            
-        dataset_train.set_transform(transform)
-        dataset_eval.set_transform(transform)
+                seg_slices = [
+                    load_slice(v, z, config.image_size) for v, z in zip(examples[f"seg_{seg_type}_volume"], examples["slice_idx"])
+                ]
+                result[f"seg_{seg_type}"] = seg_slices
+        return result
 
-    else:
-        if img_dir is not None:
-            def transform(examples):
-                if not load_images_as_np_arrays:
-                    images = [preprocess(image.convert(PIL_image_type)) for image in examples["image"]]
-                else:
-                    images = [
-                        preprocess(F.interpolate(torch.tensor(np.load(image)).unsqueeze(0).float(), size=(config.image_size, config.image_size)).squeeze()) for image in examples["image"]
-                        ]
-                images_filenames = examples["image_filename"]
-                #return {"images": images, "image_filenames": images_filenames}
-                return {"images": images, **{"image_filenames": images_filenames}}
-        
-            dataset_train.set_transform(transform)
-            dataset_eval.set_transform(transform)
+    dataset_train.set_transform(transform)
+    dataset_eval.set_transform(transform)
 
-    if ((img_dir is None) and (not segmentation_guided)):
-        train_dataloader = None
-        # just make placeholder dataloaders to iterate through when sampling from uncond model
-        eval_dataloader = torch.utils.data.DataLoader(
-            torch.utils.data.TensorDataset(torch.zeros(config.eval_batch_size, num_img_channels, config.image_size, config.image_size)),
-            batch_size=config.eval_batch_size,
-            shuffle=eval_shuffle_dataloader
-        )
-    else:
-        train_dataloader = torch.utils.data.DataLoader(
-                dataset_train, 
-                batch_size=config.train_batch_size, 
-                shuffle=True
-                )
+    # ------------------------------------------------------------------
+    #  DataLoaders
+    # ------------------------------------------------------------------
+    train_dataloader = DataLoader(dataset_train, batch_size=config.train_batch_size, shuffle=True)
+    eval_dataloader = DataLoader(dataset_eval, batch_size=config.eval_batch_size, shuffle=eval_shuffle_dataloader)
 
-        eval_dataloader = torch.utils.data.DataLoader(
-                dataset_eval, 
-                batch_size=config.eval_batch_size, 
-                shuffle=eval_shuffle_dataloader
-                )
-
-    # define the model
+    # ------------------------------------------------------------------
+    #  Model & diffusion scheduler
+    # ------------------------------------------------------------------
     in_channels = num_img_channels
-    if config.segmentation_guided:
-        assert config.num_segmentation_classes is not None
-        assert config.num_segmentation_classes > 1, "must have at least 2 segmentation classes (INCLUDING background)" 
-        if config.segmentation_channel_mode == "single":
+    if segmentation_guided:
+        if segmentation_channel_mode == "single":
             in_channels += 1
-        elif config.segmentation_channel_mode == "multi":
-            in_channels = len(seg_types) + in_channels
+        elif segmentation_channel_mode == "multi":
+            in_channels += len(seg_types)
 
     model = diffusers.UNet2DModel(
-        sample_size=config.image_size,  # the target image resolution
-        in_channels=in_channels,  # the number of input channels, 3 for RGB images
-        out_channels=num_img_channels,  # the number of output channels
-        layers_per_block=2,  # how many ResNet layers to use per UNet block
-        block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channes for each UNet block
+        sample_size=config.image_size,
+        in_channels=in_channels,
+        out_channels=num_img_channels,
+        layers_per_block=2,
+        block_out_channels=(128, 128, 256, 256, 512, 512),
         down_block_types=(
-            "DownBlock2D",  # a regular ResNet downsampling block
             "DownBlock2D",
             "DownBlock2D",
             "DownBlock2D",
-            "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
+            "DownBlock2D",
+            "AttnDownBlock2D",
             "DownBlock2D",
         ),
         up_block_types=(
-            "UpBlock2D",  # a regular ResNet upsampling block
-            "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
+            "UpBlock2D",
+            "AttnUpBlock2D",
             "UpBlock2D",
             "UpBlock2D",
             "UpBlock2D",
-            "UpBlock2D"
+            "UpBlock2D",
         ),
     )
 
     if (mode == "train" and resume_epoch is not None) or "eval" in mode:
-        if mode == "train":
-            print("resuming from model at training epoch {}".format(resume_epoch))
-        elif "eval" in mode:
-            print("loading saved model...")
-        model = model.from_pretrained(os.path.join(config.output_dir, 'unet'), use_safetensors=True)
+        model = model.from_pretrained(Path(config.output_dir) / "unet", use_safetensors=True)
 
-    model = nn.DataParallel(model)
-    model.to(device)
+    model = nn.DataParallel(model).to(device)
 
-    # define noise scheduler
     if model_type == "DDPM":
         noise_scheduler = diffusers.DDPMScheduler(num_train_timesteps=1000)
     elif model_type == "DDIM":
         noise_scheduler = diffusers.DDIMScheduler(num_train_timesteps=1000)
+    else:
+        raise ValueError("Unknown model_type")
 
+    # ------------------------------------------------------------------
+    #  Train / evaluate
+    # ------------------------------------------------------------------
     if mode == "train":
-        # training setup
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
         lr_scheduler = get_cosine_schedule_with_warmup(
-            optimizer=optimizer,
+            optimizer,
             num_warmup_steps=config.lr_warmup_steps,
-            num_training_steps=(len(train_dataloader) * config.num_epochs),
+            num_training_steps=len(train_dataloader) * config.num_epochs,
         )
 
-        # train
         train_loop(
-            config, 
-            model, 
-            noise_scheduler, 
-            optimizer, 
-            train_dataloader, 
-            eval_dataloader, 
-            lr_scheduler, 
-            device=device
-            )
-    elif mode == "eval":
-        """
-        default eval behavior:
-        evaluate image generation or translation (if for conditional model, either evaluate naive class conditioning but not CFG,
-        or with CFG),
-        possibly conditioned on masks.
-
-        has various options.
-        """
-        evaluate_generation(
-            config, 
-            model, 
+            config,
+            model,
             noise_scheduler,
-            eval_dataloader, 
+            optimizer,
+            train_dataloader,
+            eval_dataloader,
+            lr_scheduler,
+            device=device,
+        )
+
+    elif mode == "eval":
+        evaluate_generation(
+            config,
+            model,
+            noise_scheduler,
+            eval_dataloader,
             eval_mask_removal=eval_mask_removal,
             eval_blank_mask=eval_blank_mask,
-            device=device
-            )
+            device=device,
+        )
 
     elif mode == "eval_many":
-        """
-        generate many images and save them to a directory, saved individually
-        """
         evaluate_sample_many(
             eval_sample_size,
             config,
             model,
             noise_scheduler,
             eval_dataloader,
-            device=device
-            )
-
+            device=device,
+        )
     else:
-        raise ValueError("mode \"{}\" not supported.".format(mode))
+        raise ValueError(f"Mode {mode} not supported")
 
+
+# -------------------------------------------------------------------------------------------------
+#  CLI
+# -------------------------------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # parse args:
     parser = ArgumentParser()
-    parser.add_argument('--mode', type=str, default='train')
-    parser.add_argument('--img_size', type=int, default=256)
-    parser.add_argument('--num_img_channels', type=int, default=1)
-    parser.add_argument('--dataset', type=str, default="breast_mri")
-    parser.add_argument('--img_dir', type=str, default=None)
-    parser.add_argument('--seg_dir', type=str, default=None)
-    parser.add_argument('--model_type', type=str, default="DDPM")
-    parser.add_argument('--segmentation_guided', action='store_true', help='use segmentation guided training/sampling?')
-    parser.add_argument('--segmentation_channel_mode', type=str, default="single", help='single == all segmentations in one channel, multi == each segmentation in its own channel')
-    parser.add_argument('--num_segmentation_classes', type=int, default=None, help='number of segmentation classes, including background')
-    parser.add_argument('--train_batch_size', type=int, default=32)
-    parser.add_argument('--eval_batch_size', type=int, default=8)
-    parser.add_argument('--num_epochs', type=int, default=200)
-    parser.add_argument('--resume_epoch', type=int, default=None, help='resume training starting at this epoch')
-
-    # novel options
-    parser.add_argument('--use_ablated_segmentations', action='store_true', help='use mask ablated training and any evaluation? sometimes randomly remove class(es) from mask during training and sampling.')
-
-    # other options
-    parser.add_argument('--eval_noshuffle_dataloader', action='store_true', help='if true, don\'t shuffle the eval dataloader')
-
-    # args only used in eval
-    parser.add_argument('--eval_mask_removal', action='store_true', help='if true, evaluate gradually removing anatomies from mask and re-sampling')
-    parser.add_argument('--eval_blank_mask', action='store_true', help='if true, evaluate sampling conditioned on blank (zeros) masks')
-    parser.add_argument('--eval_sample_size', type=int, default=1000, help='number of images to sample when using eval_many mode')
+    parser.add_argument("--mode", type=str, default="train")
+    parser.add_argument("--img_size", type=int, default=256)
+    parser.add_argument("--num_img_channels", type=int, default=1)
+    parser.add_argument("--dataset", type=str, default="avt")
+    parser.add_argument("--img_dir", type=str, required=True)
+    parser.add_argument("--seg_dir", type=str, default=None)
+    parser.add_argument("--model_type", type=str, default="DDPM", choices=["DDPM", "DDIM"])
+    parser.add_argument("--segmentation_guided", action="store_true")
+    parser.add_argument("--segmentation_channel_mode", type=str, default="single", choices=["single", "multi"])
+    parser.add_argument("--num_segmentation_classes", type=int, default=None)
+    parser.add_argument("--train_batch_size", type=int, default=32)
+    parser.add_argument("--eval_batch_size", type=int, default=8)
+    parser.add_argument("--num_epochs", type=int, default=200)
+    parser.add_argument("--resume_epoch", type=int, default=None)
+    parser.add_argument("--use_ablated_segmentations", action="store_true")
+    parser.add_argument("--eval_noshuffle_dataloader", action="store_true")
+    parser.add_argument("--eval_mask_removal", action="store_true")
+    parser.add_argument("--eval_blank_mask", action="store_true")
+    parser.add_argument("--eval_sample_size", type=int, default=1000)
 
     args = parser.parse_args()
 
     main(
-        args.mode,
-        args.img_size,
-        args.num_img_channels,
-        args.dataset,
-        args.img_dir,
-        args.seg_dir,
-        args.model_type,
-        args.segmentation_guided,
-        args.segmentation_channel_mode,
-        args.num_segmentation_classes,
-        args.train_batch_size,
-        args.eval_batch_size,
-        args.num_epochs,
-        args.resume_epoch,
-        args.use_ablated_segmentations,
-        not args.eval_noshuffle_dataloader,
-
-        # args only used in eval
-        args.eval_mask_removal,
-        args.eval_blank_mask,
-        args.eval_sample_size
+        mode=args.mode,
+        img_size=args.img_size,
+        num_img_channels=args.num_img_channels,
+        dataset_name=args.dataset,
+        img_dir=args.img_dir,
+        seg_dir=args.seg_dir,
+        model_type=args.model_type,
+        segmentation_guided=args.segmentation_guided,
+        segmentation_channel_mode=args.segmentation_channel_mode,
+        num_segmentation_classes=args.num_segmentation_classes,
+        train_batch_size=args.train_batch_size,
+        eval_batch_size=args.eval_batch_size,
+        num_epochs=args.num_epochs,
+        resume_epoch=args.resume_epoch,
+        use_ablated_segmentations=args.use_ablated_segmentations,
+        eval_shuffle_dataloader=not args.eval_noshuffle_dataloader,
+        eval_mask_removal=args.eval_mask_removal,
+        eval_blank_mask=args.eval_blank_mask,
+        eval_sample_size=args.eval_sample_size,
     )

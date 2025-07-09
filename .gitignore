@@ -8,6 +8,11 @@ data_AVT/
 
 # Python virtual environment directories
 .macvenv/
+.venv/
 
 # Temporary files
-nrrd_checking.ipynb
+main1.py
+main_PNG.py
+
+# Logs
+runs/

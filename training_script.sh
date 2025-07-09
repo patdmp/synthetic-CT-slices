@@ -1,8 +1,3 @@
-python3 temp/split_data.py \
-    --src data_AVT \
-    --dst data
-
-
 CUDA_VISIBLE_DEVICES=0 python3 main.py \
     --mode train \
     --model_type DDIM \
@@ -12,7 +7,7 @@ CUDA_VISIBLE_DEVICES=0 python3 main.py \
     --img_dir data/data \
     --train_batch_size 8 \
     --eval_batch_size 4 \
-    --num_epochs 400
+    --num_epochs 400 \
     --seg_dir data/mask \
     --segmentation_guided \
     --num_segmentation_classes 2 \

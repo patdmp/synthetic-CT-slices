@@ -14,7 +14,7 @@ def collect_subjects(avt_root: Path) -> dict[str, List[Tuple[Path, Path]]]:
     Return {cohort: [(image_path, mask_path), ...]} mapping.
     """
     cohorts = {}
-    for cohort_dir in (avt_root / "data" / "AVT").iterdir():
+    for cohort_dir in (avt_root / "AVT").iterdir():
         if not cohort_dir.is_dir():
             continue
         cohort = cohort_dir.name
