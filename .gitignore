@@ -1,0 +1,13 @@
+.DS_Store
+*.pyc
+__pycache__/
+
+# Data
+data/
+data_AVT/
+
+# Python virtual environment directories
+.macvenv/
+
+# Temporary files
+nrrd_checking.ipynb

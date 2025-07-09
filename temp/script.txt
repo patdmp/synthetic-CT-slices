@@ -1,0 +1,3 @@
+python split_data.py \
+    --src data_AVT \
+    --dst data
