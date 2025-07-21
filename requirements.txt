@@ -8,3 +8,6 @@ pynrrd
 huggingface_hub
 aiohttp==3.8.6
 tensorboard
+monai
+torch==2.1.2
+torchvision==0.16.2

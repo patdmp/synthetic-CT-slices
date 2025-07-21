@@ -5,6 +5,7 @@ __pycache__/
 # Data
 data/
 data_AVT/
+data_dongyang/
 
 # Python virtual environment directories
 .macvenv/

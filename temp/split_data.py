@@ -18,6 +18,13 @@ def collect_subjects(avt_root: Path) -> dict[str, List[Tuple[Path, Path]]]:
         if not cohort_dir.is_dir():
             continue
         cohort = cohort_dir.name
+
+        ###
+        if not cohort == "Dongyang":
+            # Skip all cohorts except "Dongyang" for now.
+            continue
+        ###
+
         cohorts[cohort] = []
         for subject_dir in cohort_dir.iterdir():
             if not subject_dir.is_dir():
@@ -56,8 +63,8 @@ def copy_pair(img: Path, mask: Path, out_root: Path, split: str) -> None:
     Copy image and mask into <out_root>/data|mask/<split>/.
     Mask is renamed with seg_ prefix.
     """
-    dest_img = out_root / "data" / split / img.name
-    dest_mask = out_root / "mask" / split / f"seg_{img.stem}{img.suffix}"
+    dest_img = out_root / "img" / split / img.name
+    dest_mask = out_root / "seg" / "all" / split / img.name
     dest_img.parent.mkdir(parents=True, exist_ok=True)
     dest_mask.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(img, dest_img)
