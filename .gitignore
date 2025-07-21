@@ -6,6 +6,7 @@ __pycache__/
 data/
 data_AVT/
 data_dongyang/
+*.nrrd
 
 # Python virtual environment directories
 .macvenv/

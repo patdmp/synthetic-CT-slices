@@ -19,11 +19,11 @@ def collect_subjects(avt_root: Path) -> dict[str, List[Tuple[Path, Path]]]:
             continue
         cohort = cohort_dir.name
 
-        ###
-        if not cohort == "Dongyang":
-            # Skip all cohorts except "Dongyang" for now.
-            continue
-        ###
+        # ###
+        # if not cohort == "Dongyang":
+        #     # Skip all cohorts except "Dongyang" for now.
+        #     continue
+        # ###
 
         cohorts[cohort] = []
         for subject_dir in cohort_dir.iterdir():
