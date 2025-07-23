@@ -1,117 +1,99 @@
-"""
-training utils
-"""
-from dataclasses import dataclass
-import math
-import os
-from pathlib import Path
+# --- imports -----------------------------------------------------------------
 from tqdm.auto import tqdm
 import numpy as np
-from datetime import timedelta
+import os
+from pathlib import Path
+import logging
+import json
+from dataclasses import asdict, is_dataclass 
 
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
 
 import diffusers
 
 from eval import evaluate, add_segmentations_to_noise, SegGuidedDDPMPipeline, SegGuidedDDIMPipeline
 
-@dataclass
-class TrainingConfig:
-    model_type: str = "DDPM"
-    image_size: int = 256  # the generated image resolution
-    train_batch_size: int = 32
-    eval_batch_size: int = 8  # how many images to sample during evaluation
-    num_epochs: int = 200
-    gradient_accumulation_steps: int = 1
-    learning_rate: float = 1e-4
-    lr_warmup_steps: int = 500
-    save_image_epochs: int = 20
-    save_model_epochs: int = 30
-    mixed_precision: str = 'fp16'  # `no` for float32, `fp16` for automatic mixed precision
-    output_dir: str = None
+# --- main train loop ----------------------------------------------------------
+def train_loop(config, model, noise_scheduler, optimizer,
+               train_dataloader, eval_dataloader, lr_scheduler,
+               device: str = "cuda"):
 
-    push_to_hub: bool = False  # whether to upload the saved model to the HF Hub
-    hub_private_repo: bool = False
-    overwrite_output_dir: bool = True  # overwrite the old model when re-running the notebook
-    seed: int = 0
-
-    # custom options
-    segmentation_guided: bool = False
-    segmentation_channel_mode: str = "single"
-    num_segmentation_classes: int = None # INCLUDING background
-    use_ablated_segmentations: bool = False
-    dataset: str = "breast_mri"
-    resume_epoch: int = None
-
-    # EXPERIMENTAL/UNTESTED: classifier-free class guidance and image translation
-    class_conditional: bool = False
-    cfg_p_uncond: float = 0.2 # p_uncond in classifier-free guidance paper
-    cfg_weight: float = 0.3 # w in the paper
-    trans_noise_level: float = 0.5 # ratio of time step t to noise trans_start_images to total T before denoising in translation. e.g. value of 0.5 means t = 500 for default T = 1000.
-    use_cfg_for_eval_conditioning: bool = True  # whether to use classifier-free guidance for or just naive class conditioning for main sampling loop
-    cfg_maskguidance_condmodel_only: bool = True  # if using mask guidance AND cfg, only give mask to conditional network
-    # ^ this is because giving mask to both uncond and cond model make class guidance not work 
-    # (see "Classifier-free guidance resolution weighting." in ControlNet paper)
-
-
-def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, eval_dataloader, lr_scheduler, device='cuda'):
-    # Prepare everything
-    # There is no specific order to remember, you just need to unpack the
-    # objects in the same order you gave them to the prepare method.
-
-    global_step = 0
-
-    # logging
-    run_name = '{}-{}-{}'.format(config.model_type.lower(), config.dataset, config.image_size)
+    # ----------------------- 1. bookkeeping -----------------------------------
+    run_name = f"{config.model_type.lower()}-{config.dataset}-{config.image_size}"
     if config.segmentation_guided:
         run_name += "-segguided"
-    writer = SummaryWriter(comment=run_name)
 
-    # for loading segs to condition on:
-    eval_dataloader = iter(eval_dataloader)
+    log_file = Path(config.output_dir) / f"{run_name}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    # Now you train the model
-    start_epoch = 0
-    if config.resume_epoch is not None:
-        start_epoch = config.resume_epoch
+    cfg_path = log_file.parent / f"{run_name}_config.json"
+    if not cfg_path.exists():                     # don’t overwrite on resume
+        cfg_dict = asdict(config) if is_dataclass(config) else vars(config)
+        with cfg_path.open("w") as f:
+            json.dump(cfg_dict, f, indent=2)
+
+    logging.basicConfig(
+        filename=log_file,
+        filemode="a",
+        level=logging.INFO,                                 
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logger = logging.getLogger(run_name)
+
+    logger.info("======== New run started ========")
+    logger.info(f"config: {config}")
+
+    # ----------------------- 2. training --------------------------------------
+    global_step = 0
+    start_epoch = config.resume_epoch or 0
+    eval_dataloader = iter(eval_dataloader)   # keep for evaluation batches
 
     for epoch in range(start_epoch, config.num_epochs):
+        logger.info(f"Epoch {epoch+1}/{config.num_epochs}")
+        print(f"Epoch {epoch + 1}/{config.num_epochs}")
+
         progress_bar = tqdm(total=len(train_dataloader))
         progress_bar.set_description(f"Epoch {epoch}")
 
         model.train()
 
         for step, batch in enumerate(train_dataloader):
-            clean_images = batch['images']
-            clean_images = clean_images.to(device)
+            clean_images = batch["images"].to(device)
 
             # Sample noise to add to the images
-            noise = torch.randn(clean_images.shape).to(clean_images.device)
-            bs = clean_images.shape[0]
+            noise = torch.randn_like(clean_images)
+            bs = clean_images.size(0)
 
             # Sample a random timestep for each image
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bs,), device=clean_images.device).long()
 
             # Add noise to the clean images according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
+            # (FORWARD DIFFUSION PROCESS)
             noisy_images = noise_scheduler.add_noise(clean_images, noise, timesteps)
 
             if config.segmentation_guided:
-                noisy_images = add_segmentations_to_noise(noisy_images, batch, config, device)
+                noisy_images = add_segmentations_to_noise(
+                    noisy_images, batch, config, device
+                )
 
+            # --------------- forward & loss ----------------
             # Predict the noise residual
             if config.class_conditional:
-                class_labels = torch.ones(noisy_images.size(0)).long().to(device)
-                # classifier-free guidance
-                a = np.random.uniform()
-                if a <= config.cfg_p_uncond:
-                    class_labels = torch.zeros_like(class_labels).long()
-                noise_pred = model(noisy_images, timesteps, class_labels=class_labels, return_dict=False)[0]
+                class_labels = torch.ones(bs, dtype=torch.long, device=device)
+                 # classifier-free guidance
+                if np.random.uniform() <= config.cfg_p_uncond:
+                    class_labels.zero_()
+
+                noise_pred = model(
+                    noisy_images, timesteps,
+                    class_labels=class_labels, return_dict=False
+                )[0]
             else:
                 noise_pred = model(noisy_images, timesteps, return_dict=False)[0]
+
             loss = F.mse_loss(noise_pred, noise)
             loss.backward()
 
@@ -120,54 +102,59 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, eval
             lr_scheduler.step()
             optimizer.zero_grad()
 
-            # also train on target domain images if conditional
-            # (we don't have masks for this domain, so we can't do segmentation-guided; just use blank masks)
+            # -------- extra pass for target‑domain images ----------
             if config.class_conditional:
-                target_domain_images = batch['images_target']
-                target_domain_images = target_domain_images.to(device)
+                tgt_imgs = batch["images_target"].to(device)
+                tgt_noise = torch.randn_like(tgt_imgs)
+                tgt_ts = torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps,
+                    (tgt_imgs.size(0),), device=device
+                ).long()
 
-                # Sample noise to add to the images
-                noise = torch.randn(target_domain_images.shape).to(target_domain_images.device)
-                bs = target_domain_images.shape[0]
-
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bs,), device=target_domain_images.device).long()
-
-                # Add noise to the clean images according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_images = noise_scheduler.add_noise(target_domain_images, noise, timesteps)
+                tgt_noisy = noise_scheduler.add_noise(tgt_imgs, tgt_noise, tgt_ts)
 
                 if config.segmentation_guided:
-                    # no masks in target domain so just use blank masks
-                    noisy_images = torch.cat((noisy_images, torch.zeros_like(noisy_images)), dim=1)
+                    tgt_noisy = torch.cat((tgt_noisy,
+                                           torch.zeros_like(tgt_noisy)), dim=1)
 
-                # Predict the noise residual
-                class_labels = torch.full([noisy_images.size(0)], 2).long().to(device)
-                # classifier-free guidance
-                a = np.random.uniform()
-                if a <= config.cfg_p_uncond:
-                    class_labels = torch.zeros_like(class_labels).long()
-                noise_pred = model(noisy_images, timesteps, class_labels=class_labels, return_dict=False)[0]
-                loss_target_domain = F.mse_loss(noise_pred, noise)
-                loss_target_domain.backward()
+                tgt_labels = torch.full(
+                    (tgt_noisy.size(0),), 2, dtype=torch.long, device=device
+                )
+                if np.random.uniform() <= config.cfg_p_uncond:
+                    tgt_labels.zero_()
+
+                tgt_pred  = model(tgt_noisy, tgt_ts,
+                                  class_labels=tgt_labels,
+                                  return_dict=False)[0]
+                loss_tgt  = F.mse_loss(tgt_pred, tgt_noise)
+                loss_tgt.backward()
 
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            progress_bar.update(1)
+            # --------------- logging ----------------------
+            lr = lr_scheduler.get_last_lr()[0]
             if config.class_conditional:
-                logs = {"loss": loss.detach().item(), "loss_target_domain": loss_target_domain.detach().item(), 
-                        "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
-                writer.add_scalar("loss_target_domain", loss.detach().item(), global_step)
-            else: 
-                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
-            writer.add_scalar("loss", loss.detach().item(), global_step)
+                logger.info(f"step={global_step:>7} "
+                            f"loss={loss.item():.6f} "
+                            f"loss_tgt={loss_tgt.item():.6f} "
+                            f"lr={lr:.6e}")
+            else:
+                logger.info(f"step={global_step:>7} "
+                            f"loss={loss.item():.6f} "
+                            f"lr={lr:.6e}")
 
-            progress_bar.set_postfix(**logs)
+            progress_bar.set_postfix(
+                loss=loss.item(),
+                **({"loss_target_domain": loss_tgt.item()} if config.class_conditional else {}),
+                lr=lr
+            )
             global_step += 1
+            progress_bar.update(1)
 
+        # ---------------- evaluation / checkpointing ---------------
         # After each epoch you optionally sample some demo images with evaluate() and save the model
         if config.model_type == "DDPM":
             if config.segmentation_guided:
@@ -201,3 +188,5 @@ def train_loop(config, model, noise_scheduler, optimizer, train_dataloader, eval
 
         if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
             pipeline.save_pretrained(config.output_dir)
+
+    logger.info("======== Training finished ========")
