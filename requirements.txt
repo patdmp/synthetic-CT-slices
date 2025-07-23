@@ -5,9 +5,9 @@ diffusers==0.21.4
 datasets==2.14.5
 tqdm==4.66.1
 pynrrd
-huggingface_hub
+huggingface_hub==0.22.2
 aiohttp==3.8.6
 tensorboard
-monai
+monai==1.4.0
 torch==2.1.2
 torchvision==0.16.2

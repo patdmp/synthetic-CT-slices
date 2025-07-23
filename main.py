@@ -1,50 +1,3 @@
-#!/usr/bin/env python3
-"""
-Train / evaluate a 2‑D diffusion model on 3‑D NRRD volumes.
-Each axial slice of every volume is treated as an independent 2‑D example.
-The script is a drop‑in replacement for the original PNG‑based pipeline.
-
-Main differences vs. the PNG version
-------------------------------------
-1. Uses *pynrrd* to read .nrrd volumes.
-2. Builds the HuggingFace Dataset as a list of
-      { volume_path, slice_idx, image_filename, ... }
-   so we can lazily load one slice at a time.
-3. Always works in "array" mode – no PIL, no Image casting.
-4. A custom ``load_slice`` helper returns a torch tensor (1,H,W)
-   already min‑max normalised and resized.
-5. Segmentation‑guided training works the same way: a parallel
-   slice list is built for each mask volume.
-
-Folder layout expected
-----------------------
-<root>/
-  data/
-    train/  *.nrrd       # 3‑D images
-    val/    *.nrrd
-    test/   *.nrrd
-  mask/                    # optional – only if --seg_dir given
-    train/  seg_*.nrrd   # 3‑D masks aligned with the images
-    val/    ...
-    test/   ...
-
-Given that structure, run e.g.:
-
-$ python nrrd_diffusion_training.py \
-      --mode train \
-      --img_size 256 \
-      --dataset avt_kits_rider \
-      --img_dir /path/to/output_dataset_root/data \
-      --seg_dir /path/to/output_dataset_root/mask \
-      --segmentation_guided \
-      --num_segmentation_classes 2 
-
-Dependencies
-------------
-  pip install pynrrd torch torchvision diffusers datasets
-
-"""
-
 import os
 from argparse import ArgumentParser
 from pathlib import Path
@@ -90,11 +43,18 @@ def collect_nrrd_slices(split_dir: Path) -> Dict[str, List]:
         "image_filename": []   # str       unique name e.g. volname_z042.nrrd
     }
 
+    ### Subsample volumes
+    STEP = 10
+    MAX_SLICES = 100
+
     for vol_path in split_dir.glob("*.nrrd"):
         vol_path = vol_path.resolve()
         vol_data, _ = nrrd.read(vol_path)      # shape: (D,H,W)
         depth = vol_data.shape[0]
         for z in range(depth):
+        # for i, z in enumerate(range(0, depth, STEP)):
+        #     if MAX_SLICES is not None and i >= MAX_SLICES:
+        #         break
             records["volume"].append(str(vol_path))
             records["slice_idx"].append(z)
             records["image_filename"].append(f"{vol_path.stem}_z{z:03d}.nrrd")
@@ -108,6 +68,11 @@ def collect_seg_slices(seg_split_dir: Path, slice_indices: List[int]) -> List[st
     so we guarantee alignment by simply repeating the same volume path once per
     slice.
     """
+
+    ### Subsample volumes
+    STEP = 10
+    MAX_SLICES = 100
+    
     paths = []
     for vol_path in seg_split_dir.glob("*.nrrd"):
         vol_path = vol_path.resolve()
