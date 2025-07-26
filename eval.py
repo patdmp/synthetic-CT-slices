@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple, Union
 from tqdm import tqdm
 from copy import deepcopy
 import numpy as np
+from dataclasses import asdict
 
 import diffusers
 from diffusers import DiffusionPipeline, ImagePipelineOutput, DDIMScheduler
@@ -74,9 +75,18 @@ def evaluate_sample_many(
 
             # save each image in the list separately
             for i, img in enumerate(images):
+                # if config.segmentation_guided:
+                #     # name base on input mask fname
+                #     img_fname = "{}/condon_{}".format(sample_dir, seg_batch["image_filenames"][i])
                 if config.segmentation_guided:
-                    # name base on input mask fname
-                    img_fname = "{}/condon_{}".format(sample_dir, seg_batch["image_filenames"][i])
+                    original = seg_batch["image_filenames"][i]
+                    # ensure it's a plain string
+                    if not isinstance(original, str):
+                        original = str(original)
+
+                    # strip any directory & extension
+                    stem = os.path.splitext(os.path.basename(original))[0]
+                    img_fname = os.path.join(sample_dir, f"condon_{stem}.png")
                 else:
                     img_fname = f"{sample_dir}/{num_sampled + i:04d}.png"
                 img.save(img_fname)

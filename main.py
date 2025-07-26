@@ -1,16 +1,9 @@
-import logging
 import os
-import sys
-import json, pathlib, datetime
 
-import matplotlib.pyplot as plt
 import torch
-from torch.utils.tensorboard import SummaryWriter
-import numpy as np
 
 import monai
 from monai.config import print_config
-from monai.data import DataLoader
 
 import diffusers
 from diffusers.optimization import get_cosine_schedule_with_warmup
@@ -18,38 +11,48 @@ import torch.nn as nn
 
 # custom imports
 from utils import TrainConfig
-from dataset import NRRDDataset, make_loaders
+from dataset import make_loaders
 from training import train_loop
 from eval import evaluate_generation, evaluate_sample_many
 
-
-#--- Environment Setup -----------------------------------
-pin_memory = torch.cuda.is_available()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print('Device:', device)
-
-logging.basicConfig(stream=sys.stdout, level=logging.INFO)
-print_config()
-
 def main():
+    #--- Environment Setup -----------------------------------
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print('Device:', device)
+
+    # logging.basicConfig(stream=sys.stdout, level=logging.INFO)
+    # print_config()
+
     #--- Set Hyperparameters ----------------------------------------------
     cfg = TrainConfig(
         mode="train",
-        model_type="DDPM",
-        output_dir="output",
-        img_dir="data_dongyang/img",
-        seg_dir="data_dongyang/seg",
-        dataset="AVT_dongyang",
-        num_epochs=200,
+        model_type="DDIM",
+        output_dir="runs",
+        img_dir="data/img",
+        seg_dir="data/seg",
+        dataset="AVT",
+        num_epochs=400,
         image_size=256,
-        train_batch_size=4,
-        eval_batch_size=2,
+        train_batch_size=8,
+        eval_batch_size=4,
         segmentation_guided=True,
         segmentation_channel_mode="single",
         num_segmentation_classes=2,
     )
-    cfg.output_dir = "runs/AVT_dongyang"
-    pathlib.Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+    # cfg = TrainConfig(
+    #     mode="eval_many",
+    #     model_type="DDIM",
+    #     output_dir="runs/ddim-AVT_dongyang-256-segguided-20250725-045637/checkpoint-epoch400",
+    #     dataset="AVT_dongyang",
+    #     image_size=256,
+    #     eval_batch_size=8,
+    #     eval_sample_size=2000,
+    #     img_dir="data_dongyang/img",
+    #     seg_dir="data_dongyang/seg",
+    #     segmentation_guided=True,
+    #     num_segmentation_classes=2,
+    # )
+    os.makedirs(cfg.output_dir, exist_ok=True)
     
 
     #--- Load Dataset ---------------------------------------------
@@ -59,6 +62,7 @@ def main():
         img_size=cfg.image_size,
         segmentation_guided=cfg.segmentation_guided,
         batch_sizes={"train": cfg.train_batch_size, "val": cfg.eval_batch_size},
+        num_workers=4,
     )
 
     batch = next(iter(train_loader))
@@ -105,7 +109,7 @@ def main():
             print("resuming from model at training epoch {}".format(cfg.resume_epoch))
         elif "eval" in cfg.mode:
             print("loading saved model...")
-        model = model.from_pretrain0ed(os.path.join(cfg.output_dir, 'unet'), use_safetensors=True)
+        model = model.from_pretrained(os.path.join(cfg.output_dir, 'unet'), use_safetensors=True)
 
     model = nn.DataParallel(model)
     model.to(device)

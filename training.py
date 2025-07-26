@@ -1,8 +1,6 @@
-# --- imports -----------------------------------------------------------------
-from tqdm.auto import tqdm
+from tqdm import tqdm
 import numpy as np
 import os
-from pathlib import Path
 import logging
 import json
 from dataclasses import asdict, is_dataclass 
@@ -14,6 +12,7 @@ import torch.nn.functional as F
 import diffusers
 
 from eval import evaluate, add_segmentations_to_noise, SegGuidedDDPMPipeline, SegGuidedDDIMPipeline
+from datetime import datetime
 
 # --- main train loop ----------------------------------------------------------
 def train_loop(config, model, noise_scheduler, optimizer,
@@ -25,14 +24,19 @@ def train_loop(config, model, noise_scheduler, optimizer,
     if config.segmentation_guided:
         run_name += "-segguided"
 
-    log_file = Path(config.output_dir) / f"{run_name}.log"
-    log_file.parent.mkdir(parents=True, exist_ok=True)
+    dt_str = datetime.now().strftime("%Y%m%d-%H%M%S")
+    
+    output_dir = os.path.join(config.output_dir, f"{run_name}-{dt_str}")
+    os.makedirs(output_dir, exist_ok=True)
+    config.output_dir = output_dir
+    
+    log_file = os.path.join(output_dir, "training.log")
 
-    cfg_path = log_file.parent / f"{run_name}_config.json"
-    if not cfg_path.exists():                     # don’t overwrite on resume
+    cfg_path = os.path.join(output_dir, "config.json")
+    if not os.path.exists(cfg_path):                     # don’t overwrite on resume
         cfg_dict = asdict(config) if is_dataclass(config) else vars(config)
-        with cfg_path.open("w") as f:
-            json.dump(cfg_dict, f, indent=2)
+        with open(cfg_path, "w") as f:
+            json.dump(cfg_dict, f, indent=2, default=str)
 
     logging.basicConfig(
         filename=log_file,
@@ -187,6 +191,8 @@ def train_loop(config, model, noise_scheduler, optimizer,
                 evaluate(config, epoch, pipeline)
 
         if (epoch + 1) % config.save_model_epochs == 0 or epoch == config.num_epochs - 1:
-            pipeline.save_pretrained(config.output_dir)
+            # pipeline.save_pretrained(config.output_dir)
+            ckpt_dir = os.path.join(config.output_dir, f"checkpoint-epoch{epoch+1}")
+            pipeline.save_pretrained(ckpt_dir)
 
     logger.info("======== Training finished ========")
