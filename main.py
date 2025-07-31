@@ -24,34 +24,33 @@ def main():
     # print_config()
 
     #--- Set Hyperparameters ----------------------------------------------
-    cfg = TrainConfig(
-        mode="train",
-        model_type="DDIM",
-        output_dir="runs",
-        img_dir="data/img",
-        seg_dir="data/seg",
-        dataset="AVT",
-        num_epochs=400,
-        image_size=256,
-        train_batch_size=8,
-        eval_batch_size=4,
-        segmentation_guided=True,
-        segmentation_channel_mode="single",
-        num_segmentation_classes=2,
-    )
     # cfg = TrainConfig(
-    #     mode="eval_many",
+    #     mode="train",
     #     model_type="DDIM",
-    #     output_dir="runs/ddim-AVT_dongyang-256-segguided-20250725-045637/checkpoint-epoch400",
-    #     dataset="AVT_dongyang",
+    #     output_dir="runs",
+    #     img_dir="data/img",
+    #     seg_dir="data/seg",
+    #     dataset="AVT",
+    #     num_epochs=400,
     #     image_size=256,
-    #     eval_batch_size=8,
-    #     eval_sample_size=2000,
-    #     img_dir="data_dongyang/img",
-    #     seg_dir="data_dongyang/seg",
+    #     train_batch_size=8,
+    #     eval_batch_size=4,
     #     segmentation_guided=True,
+    #     segmentation_channel_mode="single",
     #     num_segmentation_classes=2,
     # )
+    cfg = TrainConfig(
+        mode="eval_many",
+        model_type="DDIM",
+        output_dir="runs/ddim-AVT-256-segguided-20250725-162416/checkpoint-epoch400",
+        dataset="AVT",
+        image_size=256,
+        eval_batch_size=8,
+        eval_sample_size=1000,
+        seg_dir="data/seg",
+        segmentation_guided=True,
+        num_segmentation_classes=2,
+    )
     os.makedirs(cfg.output_dir, exist_ok=True)
     
 

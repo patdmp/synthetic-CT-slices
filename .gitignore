@@ -15,6 +15,9 @@ data_dongyang/
 # Temporary files
 main1.py
 main_PNG.py
+training.ipynb
+cuda_checking.ipynb
 
 # Logs
 runs/
+results/

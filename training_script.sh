@@ -1,1 +1,0 @@
-python main.py --mode train --model_type DDIM --img_size 256 --num_img_channels 1 --dataset avt --img_dir data_dongyang/data --train_batch_size 16 --eval_batch_size 8 --num_epochs 400 --seg_dir data_dongyang/mask --segmentation_guided --num_segmentation_classes 2

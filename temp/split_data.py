@@ -87,19 +87,4 @@ def main(avt_root: Path, out_root: Path) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Re-structure AVT NRRD dataset.")
-    parser.add_argument(
-        "--src",
-        required=True,
-        type=Path,
-        help="Path to the directory that contains data/AVT/…",
-    )
-    parser.add_argument(
-        "--dst",
-        required=True,
-        type=Path,
-        help="Destination root directory for restructured data.",
-    )
-    args = parser.parse_args()
-    main(args.src.resolve(), args.dst.resolve())
-
+    main(Path("data_AVT"), Path("data"))
